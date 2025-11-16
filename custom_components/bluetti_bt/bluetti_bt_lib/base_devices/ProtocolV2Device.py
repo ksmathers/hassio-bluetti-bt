@@ -8,8 +8,9 @@ from .BluettiDevice import BluettiDevice
 
 
 class ProtocolV2Device(BluettiDevice):
-    def __init__(self, address: str, type: str, sn: str):
+    def __init__(self, address: str, type: str, sn: str, encrypted: bool = False):
         self.struct = DeviceStruct()
+        self._encrypted = encrypted
 
         # Device info
         self.struct.add_swap_string_field("device_type", 110, 6)
@@ -67,3 +68,9 @@ class ProtocolV2Device(BluettiDevice):
     @property
     def pack_polling_commands(self) -> List[ReadHoldingRegisters]:
         return []
+    
+    @property
+    def requires_encryption(self) -> bool:
+        """Whether this V2 device requires encrypted communication"""
+        return self._encrypted
+

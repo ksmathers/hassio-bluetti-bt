@@ -54,6 +54,9 @@ class PollingCoordinator(DataUpdateCoordinator):
         client = BleakClient(device)
         bluetti_device = build_device(address, device_name)
 
+        # Use device's requires_encryption property, but allow override from config
+        use_encryption = encrypted if encrypted is not None else bluetti_device.requires_encryption
+
         self.reader = DeviceReader(
             client,
             bluetti_device,
@@ -61,7 +64,7 @@ class PollingCoordinator(DataUpdateCoordinator):
             persistent_conn=persistent_conn,
             polling_timeout=polling_timeout,
             max_retries=max_retries,
-            encrypted=encrypted,
+            encrypted=use_encryption,
         )
 
     async def _async_update_data(self):

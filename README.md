@@ -38,3 +38,28 @@ After the installation, you can use this button to install the integration:
 ### Available controls:
 If enabled in the Integration options (you need to reload the integration if you change this option):
 AC and DC outputs
+
+## Development Tools
+
+### Device Protocol Probe Utility
+
+For developers adding support for new device models, a protocol probe utility is included:
+
+```bash
+# Scan for nearby devices
+python probe-device.py --scan
+
+# Auto-detect protocol for a device
+python probe-device.py XX:XX:XX:XX:XX:XX
+
+# Test specific configuration
+python probe-device.py XX:XX:XX:XX:XX:XX --protocol v2 --encrypted
+```
+
+See [PROBE_DEVICE_GUIDE.md](PROBE_DEVICE_GUIDE.md) for detailed usage instructions.
+
+This utility helps identify:
+- Which protocol version (V1 or V2) a device uses
+- Whether encryption is required
+- Which register addresses contain valid data
+- Sample data from the device

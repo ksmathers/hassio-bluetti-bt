@@ -89,9 +89,18 @@ class DeviceReader:
                         )
                         self.has_notifier = True
 
-                    while self.encrypted and not self.encryption.is_ready_for_commands:
-                        await asyncio.sleep(5)
-                        _LOGGER.debug("Encryption handshake not finished yet")
+                    # Wait for encryption handshake if needed
+                    if self.encrypted and not self.encryption.is_ready_for_commands:
+                        # Wait up to 15 seconds for handshake with shorter intervals
+                        for _ in range(30):
+                            if self.encryption.is_ready_for_commands:
+                                break
+                            await asyncio.sleep(0.5)
+                            _LOGGER.debug("Waiting for encryption handshake...")
+                        
+                        if not self.encryption.is_ready_for_commands:
+                            _LOGGER.error("Encryption handshake timed out")
+                            return None
 
                     # Execute polling commands
                     for command in polling_commands:
@@ -155,9 +164,37 @@ class DeviceReader:
 
             except TimeoutError as err:
                 _LOGGER.error(f"Polling timed out ({self.polling_timeout}s). Trying again later", exc_info=err)
+                # Force a reconnect on timeout to recover from stuck state
+                try:
+                    if self.has_notifier:
+                        await self.client.stop_notify(NOTIFY_UUID)
+                        self.has_notifier = False
+                except Exception:
+                    pass
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                # Reset encryption state if we were using encryption
+                if self.encrypted:
+                    self.encryption.reset()
+                    _LOGGER.info("Reset encryption state after timeout")
                 return None
             except BleakError as err:
                 _LOGGER.error("Bleak error: %s", err)
+                # Force a reconnect on BleakError too
+                try:
+                    if self.has_notifier:
+                        await self.client.stop_notify(NOTIFY_UUID)
+                        self.has_notifier = False
+                except Exception:
+                    pass
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+                if self.encrypted:
+                    self.encryption.reset()
                 return None
             finally:
                 # Disconnect if connection not persistant
@@ -175,52 +212,141 @@ class DeviceReader:
             if not parsed_data:
                 return None
 
-            # Reset Encryption keys
-            self.encryption.reset()
+            # Reset Encryption keys only if not using persistent connection
+            # For persistent connections, keep the encryption session alive
+            if not self.persistent_conn:
+                self.encryption.reset()
 
             return parsed_data
 
     async def _async_send_command(self, command: ReadHoldingRegisters) -> bytes:
         """Send command and return response"""
-        try:
-            # Prepare to make request
-            self.current_command = command
-            self.notify_future = self.create_future()
-            self.notify_response = bytearray()
+        # We'll attempt the command with retries and reconnects on transient errors
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                # Prepare to make request
+                self.current_command = command
+                self.notify_future = self.create_future()
+                self.notify_response = bytearray()
 
-            # Make request
-            _LOGGER.debug("Requesting %s", command)
+                # Make request
+                _LOGGER.debug("Requesting %s (attempt %d/%d)", command, attempt, self.max_retries)
 
-            command_bytes = bytes(command)
+                command_bytes = bytes(command)
 
-            # Encrypt command
-            if self.encrypted is True:
-                if not self.encryption.is_ready_for_commands:
-                    return bytes()
-                command_bytes = self.encryption.aes_encrypt(command_bytes, self.encryption.secure_aes_key, None)
+                # Encrypt command
+                if self.encrypted is True:
+                    if not self.encryption.is_ready_for_commands:
+                        return bytes()
+                    command_bytes = self.encryption.aes_encrypt(command_bytes, self.encryption.secure_aes_key, None)
 
-            await self.client.write_gatt_char(WRITE_UUID, command_bytes)
+                await self.client.write_gatt_char(WRITE_UUID, command_bytes)
 
-            # Wait for response
-            res = await asyncio.wait_for(self.notify_future, timeout=RESPONSE_TIMEOUT)
+                # Wait for response
+                res = await asyncio.wait_for(self.notify_future, timeout=RESPONSE_TIMEOUT)
 
-            # Process data
-            _LOGGER.debug("Got %s bytes", len(res))
-            return cast(bytes, res)
+                # Process data
+                _LOGGER.debug("Got %s bytes", len(res))
+                return cast(bytes, res)
 
-        except TimeoutError:
-            _LOGGER.debug("Polling single command timed out")
-        except ModbusError as err:
-            _LOGGER.debug(
-                "Got an invalid request error for %s: %s",
-                command,
-                err,
-            )
-        except (BadConnectionError, BleakError) as err:
-            # Ignore other errors
-            pass
+            except asyncio.CancelledError as err:
+                # Bleak/CoreBluetooth sometimes cancels pending writes; try to reconnect and retry
+                _LOGGER.warning("Write was cancelled (attempt %d/%d): %s", attempt, self.max_retries, err)
+                # Clean up the future to avoid leaking
+                try:
+                    if self.notify_future and not self.notify_future.done():
+                        self.notify_future.cancel()
+                except Exception:
+                    pass
 
-        # caught an exception, return empty bytes object
+                # Attempt a quick reconnect and re-start notifications
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+
+                # Small backoff before reconnecting
+                await asyncio.sleep(1)
+
+                try:
+                    await self.client.connect()
+                    # Restart notifier if needed
+                    try:
+                        if not self.has_notifier:
+                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
+                            self.has_notifier = True
+                        else:
+                            # Ensure notifier is running
+                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
+                    except Exception:
+                        # ignore notifier start errors here; next loop will handle
+                        pass
+                except Exception as e2:
+                    _LOGGER.debug("Reconnect attempt failed: %s", e2)
+
+                # if last attempt, fall through to return empty bytes
+                if attempt == self.max_retries:
+                    _LOGGER.error("Max retries reached for command %s after CancelledError", command)
+                    break
+                # otherwise retry
+                continue
+
+            except TimeoutError:
+                _LOGGER.debug("Polling single command timed out")
+                # On timeout, try to cancel the notify future and retry if attempts remain
+                try:
+                    if self.notify_future and not self.notify_future.done():
+                        self.notify_future.cancel()
+                except Exception:
+                    pass
+
+                if attempt == self.max_retries:
+                    break
+                await asyncio.sleep(0.5)
+                continue
+
+            except ModbusError as err:
+                _LOGGER.debug(
+                    "Got an invalid request error for %s: %s",
+                    command,
+                    err,
+                )
+                break
+
+            except (BadConnectionError, BleakError) as err:
+                _LOGGER.warning("Bleak/connection error on write (attempt %d/%d): %s", attempt, self.max_retries, err)
+                # try to reconnect and retry
+                try:
+                    if self.notify_future and not self.notify_future.done():
+                        self.notify_future.cancel()
+                except Exception:
+                    pass
+
+                try:
+                    await self.client.disconnect()
+                except Exception:
+                    pass
+
+                await asyncio.sleep(1)
+                try:
+                    await self.client.connect()
+                    try:
+                        if not self.has_notifier:
+                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
+                            self.has_notifier = True
+                        else:
+                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
+                    except Exception:
+                        pass
+                except Exception as e2:
+                    _LOGGER.debug("Reconnect after BleakError failed: %s", e2)
+
+                if attempt == self.max_retries:
+                    _LOGGER.error("Max retries reached for command %s after BleakError", command)
+                    break
+                continue
+
+        # caught an exception or exhausted retries, return empty bytes object
         return bytes()
 
     async def _notification_handler(self, _sender: int, data: bytearray):

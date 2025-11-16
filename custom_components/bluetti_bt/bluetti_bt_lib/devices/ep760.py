@@ -10,7 +10,7 @@ from ..base_devices.ProtocolV2Device import ProtocolV2Device
 
 class EP760(ProtocolV2Device):
     def __init__(self, address: str, sn: str):
-        super().__init__(address, "EP760", sn)
+        super().__init__(address, "EP760", sn, encrypted=True)
  # Details
         self.struct.add_uint_field("battery_range_start", 2022)
         self.struct.add_uint_field("battery_range_end", 2023)
