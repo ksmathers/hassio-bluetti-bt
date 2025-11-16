@@ -67,12 +67,25 @@ class DeviceReader:
         async with self.polling_lock:
             try:
                 async with async_timeout.timeout(self.polling_timeout):
-                    # Reconnect if not connected
+                    # Reconnect if not connected (with timeout protection)
                     for attempt in range(1, self.max_retries + 1):
                         try:
                             if not self.client.is_connected:
-                                await self.client.connect()
+                                _LOGGER.info("Client not connected, attempting to connect (attempt %d/%d)", attempt, self.max_retries)
+                                await asyncio.wait_for(self.client.connect(), timeout=10.0)
+                                _LOGGER.info("Connected successfully")
                             break
+                        except asyncio.TimeoutError:
+                            _LOGGER.warning(f"Connect timed out (attempt {attempt}). Retrying...")
+                            if attempt < self.max_retries:
+                                # Try to force disconnect before retry
+                                try:
+                                    await asyncio.wait_for(self.client.disconnect(), timeout=2.0)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(2)
+                            else:
+                                raise Exception("Failed to connect after all retry attempts")
                         except Exception as e:
                             if attempt == self.max_retries:
                                 raise e # pass exception on max_retries attempt
@@ -80,6 +93,11 @@ class DeviceReader:
                                 _LOGGER.warning(
                                     f"Connect unsucessful (attempt {attempt}): {e}. Retrying..."
                                 )
+                                # Try to force disconnect before retry
+                                try:
+                                    await asyncio.wait_for(self.client.disconnect(), timeout=2.0)
+                                except Exception:
+                                    pass
                                 await asyncio.sleep(2)
 
                     # Attach notifier if needed
@@ -259,30 +277,40 @@ class DeviceReader:
                 except Exception:
                     pass
 
-                # Attempt a quick reconnect and re-start notifications
+                # Force a hard disconnect and reconnect with timeout protection
                 try:
-                    await self.client.disconnect()
+                    if self.has_notifier:
+                        try:
+                            await asyncio.wait_for(self.client.stop_notify(NOTIFY_UUID), timeout=2.0)
+                        except Exception:
+                            pass
+                        self.has_notifier = False
+                except Exception:
+                    pass
+
+                try:
+                    await asyncio.wait_for(self.client.disconnect(), timeout=3.0)
                 except Exception:
                     pass
 
                 # Small backoff before reconnecting
                 await asyncio.sleep(1)
 
+                # Try to reconnect with timeout protection
                 try:
-                    await self.client.connect()
-                    # Restart notifier if needed
+                    await asyncio.wait_for(self.client.connect(), timeout=10.0)
+                    # Restart notifier
                     try:
-                        if not self.has_notifier:
-                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
-                            self.has_notifier = True
-                        else:
-                            # Ensure notifier is running
-                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
-                    except Exception:
-                        # ignore notifier start errors here; next loop will handle
-                        pass
+                        await asyncio.wait_for(
+                            self.client.start_notify(NOTIFY_UUID, self._notification_handler),
+                            timeout=5.0
+                        )
+                        self.has_notifier = True
+                        _LOGGER.info("Successfully reconnected and restarted notifications")
+                    except Exception as e3:
+                        _LOGGER.warning("Failed to restart notifications after reconnect: %s", e3)
                 except Exception as e2:
-                    _LOGGER.debug("Reconnect attempt failed: %s", e2)
+                    _LOGGER.warning("Reconnect attempt %d failed: %s", attempt, e2)
 
                 # if last attempt, fall through to return empty bytes
                 if attempt == self.max_retries:
@@ -322,24 +350,38 @@ class DeviceReader:
                 except Exception:
                     pass
 
+                # Force hard disconnect with timeout protection
                 try:
-                    await self.client.disconnect()
+                    if self.has_notifier:
+                        try:
+                            await asyncio.wait_for(self.client.stop_notify(NOTIFY_UUID), timeout=2.0)
+                        except Exception:
+                            pass
+                        self.has_notifier = False
+                except Exception:
+                    pass
+
+                try:
+                    await asyncio.wait_for(self.client.disconnect(), timeout=3.0)
                 except Exception:
                     pass
 
                 await asyncio.sleep(1)
+                
+                # Reconnect with timeout protection
                 try:
-                    await self.client.connect()
+                    await asyncio.wait_for(self.client.connect(), timeout=10.0)
                     try:
-                        if not self.has_notifier:
-                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
-                            self.has_notifier = True
-                        else:
-                            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
-                    except Exception:
-                        pass
+                        await asyncio.wait_for(
+                            self.client.start_notify(NOTIFY_UUID, self._notification_handler),
+                            timeout=5.0
+                        )
+                        self.has_notifier = True
+                        _LOGGER.info("Successfully reconnected after BleakError")
+                    except Exception as e3:
+                        _LOGGER.warning("Failed to restart notifications: %s", e3)
                 except Exception as e2:
-                    _LOGGER.debug("Reconnect after BleakError failed: %s", e2)
+                    _LOGGER.warning("Reconnect after BleakError failed (attempt %d): %s", attempt, e2)
 
                 if attempt == self.max_retries:
                     _LOGGER.error("Max retries reached for command %s after BleakError", command)
