@@ -13,3 +13,8 @@ class ModbusError(Exception):
 
 class BadConnectionError(Exception):
     pass
+
+
+class ConnectionRecoveryError(Exception):
+    """Raised when connection cannot be recovered after multiple attempts."""
+    pass

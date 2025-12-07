@@ -10,7 +10,7 @@ from custom_components.bluetti_bt.bluetti_bt_lib.bluetooth.encryption import Blu
 
 from ..base_devices.BluettiDevice import BluettiDevice
 from ..const import NOTIFY_UUID, RESPONSE_TIMEOUT, WRITE_UUID
-from ..exceptions import BadConnectionError, ModbusError, ParseError
+from ..exceptions import BadConnectionError, ConnectionRecoveryError, ModbusError, ParseError
 from ..utils.commands import ReadHoldingRegisters
 
 _LOGGER = logging.getLogger(__name__)
@@ -72,6 +72,10 @@ class DeviceReader:
                         try:
                             if not self.client.is_connected:
                                 _LOGGER.info("Client not connected, attempting to connect (attempt %d/%d)", attempt, self.max_retries)
+                                # Reset notification state since we're reconnecting
+                                self.has_notifier = False
+                                if self.encrypted:
+                                    self.encryption.reset()
                                 await asyncio.wait_for(self.client.connect(), timeout=10.0)
                                 _LOGGER.info("Connected successfully")
                             break
@@ -102,10 +106,18 @@ class DeviceReader:
 
                     # Attach notifier if needed
                     if not self.has_notifier:
-                        await self.client.start_notify(
-                            NOTIFY_UUID, self._notification_handler
-                        )
-                        self.has_notifier = True
+                        try:
+                            await self.client.start_notify(
+                                NOTIFY_UUID, self._notification_handler
+                            )
+                            self.has_notifier = True
+                        except ValueError as e:
+                            if "already started" in str(e):
+                                # Notifications already registered - sync our state
+                                _LOGGER.warning("Notifications already started, syncing state")
+                                self.has_notifier = True
+                            else:
+                                raise
 
                     # Wait for encryption handshake if needed
                     if self.encrypted and not self.encryption.is_ready_for_commands:
@@ -121,11 +133,37 @@ class DeviceReader:
                             return None
 
                     # Execute polling commands
+                    consecutive_failures = 0
                     for command in polling_commands:
                         try:
-                            body = command.parse_response(
-                                await self._async_send_command(command)
-                            )
+                            response = await self._async_send_command(command)
+                            
+                            # Check if command failed completely (empty response after retries)
+                            if not response:
+                                consecutive_failures += 1
+                                _LOGGER.warning("Command %s returned empty response (failure %d)", command, consecutive_failures)
+                                
+                                # If we get multiple consecutive failures, force reconnect
+                                if consecutive_failures >= 3:
+                                    _LOGGER.error("Multiple consecutive command failures, forcing reconnect")
+                                    # Force disconnect and raise to trigger reconnect
+                                    try:
+                                        if self.has_notifier:
+                                            await asyncio.wait_for(self.client.stop_notify(NOTIFY_UUID), timeout=2.0)
+                                            self.has_notifier = False
+                                    except Exception:
+                                        pass
+                                    try:
+                                        await asyncio.wait_for(self.client.disconnect(), timeout=3.0)
+                                    except Exception:
+                                        pass
+                                    if self.encrypted:
+                                        self.encryption.reset()
+                                    raise BleakError("Too many consecutive command failures")
+                                continue
+                            
+                            consecutive_failures = 0  # Reset on success
+                            body = command.parse_response(response)
                             _LOGGER.debug("Raw data: %s", body)
                             parsed = self.bluetti_device.parse(
                                 command.starting_address, body
@@ -239,6 +277,12 @@ class DeviceReader:
 
     async def _async_send_command(self, command: ReadHoldingRegisters) -> bytes:
         """Send command and return response"""
+        import time
+        
+        # Track total time spent in retries - limit to ~30 seconds
+        max_retry_time = 30.0
+        retry_start_time = time.time()
+        
         # We'll attempt the command with retries and reconnects on transient errors
         for attempt in range(1, self.max_retries + 1):
             try:
@@ -293,12 +337,45 @@ class DeviceReader:
                 except Exception:
                     pass
 
-                # Small backoff before reconnecting
-                await asyncio.sleep(1)
+                # Reset encryption state if using encryption
+                if self.encrypted:
+                    self.encryption.reset()
+                    _LOGGER.debug("Reset encryption state after CancelledError")
+
+                # Check if we've exceeded retry time limit before wasting time on backoff
+                elapsed_time = time.time() - retry_start_time
+                if elapsed_time > max_retry_time:
+                    _LOGGER.error("Retry time limit exceeded (%.1fs) - forcing connection restart", elapsed_time)
+                    raise ConnectionRecoveryError(f"Retry operations exceeded {max_retry_time}s time limit")
+                
+                # Exponential backoff before reconnecting (longer delays for later attempts)
+                backoff_delay = min(1 * (2 ** (attempt - 1)), 10)  # 1s, 2s, 4s, 8s, 10s
+                _LOGGER.debug("Waiting %ds before reconnection attempt...", backoff_delay)
+                await asyncio.sleep(backoff_delay)
 
                 # Try to reconnect with timeout protection
+                reconnect_success = False
                 try:
+                    _LOGGER.info("Attempting to reconnect (attempt %d/%d)...", attempt, self.max_retries)
                     await asyncio.wait_for(self.client.connect(), timeout=10.0)
+                    _LOGGER.info("Reconnected successfully")
+                    
+                    # Wait for encryption handshake if needed
+                    if self.encrypted:
+                        _LOGGER.debug("Waiting for encryption handshake after reconnect...")
+                        handshake_timeout = 20  # Give more time for handshake
+                        for i in range(handshake_timeout * 2):  # Check every 0.5s
+                            if self.encryption.is_ready_for_commands:
+                                _LOGGER.info("Encryption handshake complete")
+                                break
+                            await asyncio.sleep(0.5)
+                            if i % 10 == 9:  # Log every 5 seconds
+                                _LOGGER.debug("Still waiting for encryption handshake... (%ds)", (i + 1) // 2)
+                        
+                        if not self.encryption.is_ready_for_commands:
+                            _LOGGER.error("Encryption handshake timed out after %ds", handshake_timeout)
+                            raise Exception("Encryption handshake timeout")
+                    
                     # Restart notifier
                     try:
                         await asyncio.wait_for(
@@ -306,17 +383,45 @@ class DeviceReader:
                             timeout=5.0
                         )
                         self.has_notifier = True
-                        _LOGGER.info("Successfully reconnected and restarted notifications")
+                        reconnect_success = True
+                        _LOGGER.info("Successfully restarted notifications")
+                    except ValueError as e3:
+                        if "already started" in str(e3):
+                            _LOGGER.info("Notifications already started after reconnect, syncing state")
+                            self.has_notifier = True
+                            reconnect_success = True
+                        else:
+                            _LOGGER.error("Failed to restart notifications: %s", e3)
+                            raise
                     except Exception as e3:
-                        _LOGGER.warning("Failed to restart notifications after reconnect: %s", e3)
+                        _LOGGER.error("Failed to restart notifications: %s", e3)
+                        raise
                 except Exception as e2:
-                    _LOGGER.warning("Reconnect attempt %d failed: %s", attempt, e2)
+                    _LOGGER.error("Reconnect attempt %d failed: %s", attempt, e2)
+                    reconnect_success = False
 
-                # if last attempt, fall through to return empty bytes
+                # if last attempt and reconnect failed, give up
                 if attempt == self.max_retries:
-                    _LOGGER.error("Max retries reached for command %s after CancelledError", command)
+                    if not reconnect_success:
+                        _LOGGER.error("Failed to recover from CancelledError after %d attempts - forcing connection restart", self.max_retries)
+                        raise ConnectionRecoveryError(f"Failed to recover connection after {self.max_retries} attempts")
+                    else:
+                        _LOGGER.error("Max retries reached for command %s after CancelledError (reconnect succeeded but command still failing)", command)
                     break
-                # otherwise retry
+                
+                # If reconnect failed, don't bother retrying the command - force restart
+                if not reconnect_success:
+                    _LOGGER.error("Reconnection failed - forcing connection restart")
+                    raise ConnectionRecoveryError("Failed to reconnect to device")
+                
+                # Check if we've exceeded retry time limit even after successful reconnect
+                elapsed_time = time.time() - retry_start_time
+                if elapsed_time > max_retry_time:
+                    _LOGGER.error("Retry time limit exceeded (%.1fs) after reconnect - forcing connection restart", elapsed_time)
+                    raise ConnectionRecoveryError(f"Retry operations exceeded {max_retry_time}s time limit")
+                
+                # otherwise retry with the restored connection
+                _LOGGER.info("Retrying command after successful reconnection...")
                 continue
 
             except TimeoutError:
@@ -366,26 +471,89 @@ class DeviceReader:
                 except Exception:
                     pass
 
-                await asyncio.sleep(1)
+                # Reset encryption state if using encryption
+                if self.encrypted:
+                    self.encryption.reset()
+                    _LOGGER.debug("Reset encryption state after BleakError")
+
+                # Check if we've exceeded retry time limit before wasting time on backoff
+                elapsed_time = time.time() - retry_start_time
+                if elapsed_time > max_retry_time:
+                    _LOGGER.error("Retry time limit exceeded (%.1fs) - forcing connection restart", elapsed_time)
+                    raise ConnectionRecoveryError(f"Retry operations exceeded {max_retry_time}s time limit")
+                
+                # Exponential backoff before reconnecting (longer delays for later attempts)
+                backoff_delay = min(1 * (2 ** (attempt - 1)), 10)  # 1s, 2s, 4s, 8s, 10s
+                _LOGGER.debug("Waiting %ds before reconnection attempt...", backoff_delay)
+                await asyncio.sleep(backoff_delay)
                 
                 # Reconnect with timeout protection
+                reconnect_success = False
                 try:
+                    _LOGGER.info("Attempting to reconnect after BleakError (attempt %d/%d)...", attempt, self.max_retries)
                     await asyncio.wait_for(self.client.connect(), timeout=10.0)
+                    _LOGGER.info("Reconnected successfully")
+                    
+                    # Wait for encryption handshake if needed
+                    if self.encrypted:
+                        _LOGGER.debug("Waiting for encryption handshake after reconnect...")
+                        handshake_timeout = 20  # Give more time for handshake
+                        for i in range(handshake_timeout * 2):  # Check every 0.5s
+                            if self.encryption.is_ready_for_commands:
+                                _LOGGER.info("Encryption handshake complete")
+                                break
+                            await asyncio.sleep(0.5)
+                            if i % 10 == 9:  # Log every 5 seconds
+                                _LOGGER.debug("Still waiting for encryption handshake... (%ds)", (i + 1) // 2)
+                        
+                        if not self.encryption.is_ready_for_commands:
+                            _LOGGER.error("Encryption handshake timed out after %ds", handshake_timeout)
+                            raise Exception("Encryption handshake timeout")
+                    
                     try:
                         await asyncio.wait_for(
                             self.client.start_notify(NOTIFY_UUID, self._notification_handler),
                             timeout=5.0
                         )
                         self.has_notifier = True
-                        _LOGGER.info("Successfully reconnected after BleakError")
+                        reconnect_success = True
+                        _LOGGER.info("Successfully restarted notifications")
+                    except ValueError as e3:
+                        if "already started" in str(e3):
+                            _LOGGER.info("Notifications already started after BleakError reconnect, syncing state")
+                            self.has_notifier = True
+                            reconnect_success = True
+                        else:
+                            _LOGGER.error("Failed to restart notifications: %s", e3)
+                            raise
                     except Exception as e3:
-                        _LOGGER.warning("Failed to restart notifications: %s", e3)
+                        _LOGGER.error("Failed to restart notifications: %s", e3)
+                        raise
                 except Exception as e2:
-                    _LOGGER.warning("Reconnect after BleakError failed (attempt %d): %s", attempt, e2)
+                    _LOGGER.error("Reconnect after BleakError failed (attempt %d): %s", attempt, e2)
+                    reconnect_success = False
 
                 if attempt == self.max_retries:
-                    _LOGGER.error("Max retries reached for command %s after BleakError", command)
+                    if not reconnect_success:
+                        _LOGGER.error("Failed to recover from BleakError after %d attempts - forcing connection restart", self.max_retries)
+                        raise ConnectionRecoveryError(f"Failed to recover connection after {self.max_retries} attempts")
+                    else:
+                        _LOGGER.error("Max retries reached for command %s after BleakError (reconnect succeeded but command still failing)", command)
                     break
+                
+                # If reconnect failed, don't bother retrying the command - force restart
+                if not reconnect_success:
+                    _LOGGER.error("Reconnection failed - forcing connection restart")
+                    raise ConnectionRecoveryError("Failed to reconnect to device")
+                
+                # Check if we've exceeded retry time limit even after successful reconnect
+                elapsed_time = time.time() - retry_start_time
+                if elapsed_time > max_retry_time:
+                    _LOGGER.error("Retry time limit exceeded (%.1fs) after reconnect - forcing connection restart", elapsed_time)
+                    raise ConnectionRecoveryError(f"Retry operations exceeded {max_retry_time}s time limit")
+                
+                # otherwise retry with the restored connection
+                _LOGGER.info("Retrying command after successful reconnection...")
                 continue
 
         # caught an exception or exhausted retries, return empty bytes object

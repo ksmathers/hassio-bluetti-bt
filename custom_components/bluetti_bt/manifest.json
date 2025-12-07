@@ -9,6 +9,7 @@
         { "local_name": "AC200*" },
         { "local_name": "AC300*" },
         { "local_name": "AC500*" },
+        { "local_name": "AP300*" },
         { "local_name": "EB3A*" },
         { "local_name": "EP500*" },
         { "local_name": "EP600*" },

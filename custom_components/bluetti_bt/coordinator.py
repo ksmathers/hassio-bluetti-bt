@@ -44,27 +44,39 @@ class PollingCoordinator(DataUpdateCoordinator):
         )
 
         self.address = address
-
-        # Create client
-        self.logger.debug("Creating client")
-        device = bluetooth.async_ble_device_from_address(hass, address)
-        if device is None:
-            self.logger.error("Device %s not available", mac_loggable(address))
-            return None
-        client = BleakClient(device)
-        bluetti_device = build_device(address, device_name)
-
+        self.device_name = device_name
+        self.persistent_conn = persistent_conn
+        self.polling_timeout = polling_timeout
+        self.max_retries = max_retries
+        self.encrypted = encrypted
+        
+        self.bluetti_device = build_device(address, device_name)
+        
         # Use device's requires_encryption property, but allow override from config
-        use_encryption = encrypted if encrypted is not None else bluetti_device.requires_encryption
+        self.use_encryption = encrypted if encrypted is not None else self.bluetti_device.requires_encryption
+        
+        # Create initial client and reader
+        self.reader = None
+        self._create_reader()
 
+    def _create_reader(self):
+        """Create or recreate the BleakClient and DeviceReader."""
+        self.logger.debug("Creating BleakClient and DeviceReader")
+        device = bluetooth.async_ble_device_from_address(self.hass, self.address)
+        if device is None:
+            self.logger.error("Device %s not available", mac_loggable(self.address))
+            return
+        
+        client = BleakClient(device)
+        
         self.reader = DeviceReader(
             client,
-            bluetti_device,
+            self.bluetti_device,
             self.hass.loop.create_future,
-            persistent_conn=persistent_conn,
-            polling_timeout=polling_timeout,
-            max_retries=max_retries,
-            encrypted=use_encryption,
+            persistent_conn=self.persistent_conn,
+            polling_timeout=self.polling_timeout,
+            max_retries=self.max_retries,
+            encrypted=self.use_encryption,
         )
 
     async def _async_update_data(self):
@@ -73,6 +85,7 @@ class PollingCoordinator(DataUpdateCoordinator):
         This is the place to pre-process the data to lookup tables
         so entities can quickly look up their data.
         """
+        from .bluetti_bt_lib.exceptions import ConnectionRecoveryError
 
         # Check if device is connected
         if bluetooth.async_address_present(self.hass, self.address, connectable=True) is False:
@@ -80,4 +93,18 @@ class PollingCoordinator(DataUpdateCoordinator):
             self.last_update_success = False
             return None
 
-        return await self.reader.read_data()
+        # Ensure reader is initialized
+        if self.reader is None:
+            self.logger.warning("Reader not initialized, creating...")
+            self._create_reader()
+            if self.reader is None:
+                return None
+
+        try:
+            return await self.reader.read_data()
+        except ConnectionRecoveryError as e:
+            # Connection needs to be reinitialized
+            self.logger.warning("Connection recovery needed: %s - reinitializing client", e)
+            self._create_reader()
+            # Return None for this update cycle - will retry on next poll
+            return None

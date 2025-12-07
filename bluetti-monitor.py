@@ -49,7 +49,8 @@ class BluettiMonitor:
         verbose: bool = False,
         avro_file: Optional[str] = None,
         avro_wide: bool = False,
-        avro_flush: bool = False
+        avro_flush: bool = False,
+        avro_history: int = 5
     ):
         self.address = address
         self.name = name
@@ -64,11 +65,50 @@ class BluettiMonitor:
         self.avro_file = avro_file
         self.avro_wide = avro_wide
         self.avro_flush = avro_flush
+        self.avro_history = avro_history
         self.avro_writer = None
         self.avro_fp = None
         
         if self.avro_file:
+            self._rotate_avro_files()
             self._init_avro()
+    
+    def _rotate_avro_files(self):
+        """Rotate existing Avro files before starting new recording."""
+        if not self.avro_file:
+            return
+        
+        avro_path = Path(self.avro_file)
+        
+        # If the target file doesn't exist, nothing to rotate
+        if not avro_path.exists():
+            return
+        
+        # Get the stem and suffix
+        stem = avro_path.stem
+        suffix = avro_path.suffix
+        parent = avro_path.parent
+        
+        # Rotate existing numbered files from highest to lowest
+        # This ensures we don't overwrite any files
+        for i in range(self.avro_history - 1, 0, -1):
+            old_file = parent / f"{stem}.{i}{suffix}"
+            new_file = parent / f"{stem}.{i+1}{suffix}"
+            
+            if old_file.exists():
+                if new_file.exists():
+                    new_file.unlink()  # Remove the old file at position i+1
+                old_file.rename(new_file)
+                if self.verbose:
+                    print(f"Rotated: {old_file.name} → {new_file.name}")
+        
+        # Rotate the current file to .1
+        new_file = parent / f"{stem}.1{suffix}"
+        if new_file.exists():
+            new_file.unlink()
+        avro_path.rename(new_file)
+        
+        print(f"✓ Rotated existing Avro file: {avro_path.name} → {new_file.name}")
     
     def _init_avro(self):
         """Initialize Avro file writer."""
@@ -222,8 +262,104 @@ class BluettiMonitor:
         timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(f"[{timestamp}] ✓ {key}: {value}")
     
+    async def _run_monitoring_session(self, client: BleakClient, use_encryption: bool) -> None:
+        """Run a single monitoring session with the connected client."""
+        if not client.is_connected:
+            self.print_status("Failed to connect to device", "✗")
+            return
+        
+        self.print_status("Connected to device", "✓")
+        
+        # Create device reader
+        reader = DeviceReader(
+            bleak_client=client,
+            bluetti_device=self.device,
+            future_builder_method=asyncio.get_event_loop().create_future,
+            persistent_conn=True,
+            polling_timeout=30,
+            max_retries=3,
+            encrypted=use_encryption
+        )
+        
+        # Wait for encryption if needed
+        if use_encryption:
+            self.print_status("Waiting for encryption handshake...")
+            
+            # Manually start notifications to trigger handshake
+            if not reader.has_notifier:
+                from custom_components.bluetti_bt.bluetti_bt_lib.const import NOTIFY_UUID
+                await client.start_notify(NOTIFY_UUID, reader._notification_handler)
+                reader.has_notifier = True
+            
+            for i in range(30):
+                if reader.encryption.is_ready_for_commands:
+                    self.print_status("Encryption ready", "✓")
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                self.print_status("Encryption handshake timeout", "✗")
+                return
+        
+        self.print_status(f"Starting monitoring (Ctrl+C to stop)...")
+        print()
+        
+        poll_count = 0
+        
+        # Monitoring loop
+        while self.running:
+            poll_count += 1
+            
+            if self.verbose:
+                self.print_status(f"Poll #{poll_count}")
+            
+            try:
+                # Read all data from device
+                data = await reader.read_data()
+                
+                if data:
+                    # Write to Avro if configured
+                    if self.avro_file:
+                        if self.avro_wide:
+                            # Wide format: write all values every time
+                            self._write_avro_record(data)
+                        else:
+                            # Narrow format: write all values (changes tracked separately)
+                            self._write_avro_record(data)
+                    
+                    # Check for changes
+                    changes_detected = False
+                    
+                    for key, value in sorted(data.items()):
+                        if key not in self.previous_values:
+                            # First time seeing this value
+                            self.print_initial(key, value)
+                            self.previous_values[key] = value
+                            changes_detected = True
+                        elif self.previous_values[key] != value:
+                            # Value changed
+                            self.print_change(key, self.previous_values[key], value)
+                            self.previous_values[key] = value
+                            changes_detected = True
+                    
+                    if self.verbose and not changes_detected and poll_count > 1:
+                        self.print_status("No changes detected")
+                else:
+                    if self.verbose:
+                        self.print_status("No data received", "⚠")
+            
+            except Exception as e:
+                self.print_status(f"Error reading data: {e}", "✗")
+                if self.verbose:
+                    import traceback
+                    traceback.print_exc()
+            
+            # Wait for next poll
+            await asyncio.sleep(self.interval)
+    
     async def monitor(self):
         """Main monitoring loop."""
+        from custom_components.bluetti_bt.bluetti_bt_lib.exceptions import ConnectionRecoveryError
+        
         try:
             # Build device from name
             self.device = build_device(self.address, self.name)
@@ -241,99 +377,29 @@ class BluettiMonitor:
             
             use_encryption = self.encrypted or self.device.requires_encryption
             
-            async with BleakClient(self.address, timeout=15.0) as client:
-                if not client.is_connected:
-                    self.print_status("Failed to connect to device", "✗")
-                    return
+            # Connection retry loop - will restart on ConnectionRecoveryError
+            self.running = True
+            connection_attempt = 0
+            while self.running:
+                connection_attempt += 1
                 
-                self.print_status("Connected to device", "✓")
-                
-                # Create device reader
-                reader = DeviceReader(
-                    bleak_client=client,
-                    bluetti_device=self.device,
-                    future_builder_method=asyncio.get_event_loop().create_future,
-                    persistent_conn=True,
-                    polling_timeout=30,
-                    max_retries=3,
-                    encrypted=use_encryption
-                )
-                
-                # Wait for encryption if needed
-                if use_encryption:
-                    self.print_status("Waiting for encryption handshake...")
+                try:
+                    if connection_attempt > 1:
+                        # Wait before retrying connection
+                        retry_delay = min(30, 5 * connection_attempt)
+                        self.print_status(f"Waiting {retry_delay}s before reconnection attempt #{connection_attempt}...", "⏱")
+                        await asyncio.sleep(retry_delay)
                     
-                    # Manually start notifications to trigger handshake
-                    if not reader.has_notifier:
-                        from custom_components.bluetti_bt.bluetti_bt_lib.const import NOTIFY_UUID
-                        await client.start_notify(NOTIFY_UUID, reader._notification_handler)
-                        reader.has_notifier = True
+                    async with BleakClient(self.address, timeout=15.0) as client:
+                        await self._run_monitoring_session(client, use_encryption)
+                        connection_attempt = 0  # Reset on successful session
                     
-                    for i in range(30):
-                        if reader.encryption.is_ready_for_commands:
-                            self.print_status("Encryption ready", "✓")
-                            break
-                        await asyncio.sleep(0.5)
-                    else:
-                        self.print_status("Encryption handshake timeout", "✗")
-                        return
-                
-                self.print_status(f"Starting monitoring (Ctrl+C to stop)...")
-                print()
-                
-                self.running = True
-                poll_count = 0
-                
-                # Monitoring loop
-                while self.running:
-                    poll_count += 1
-                    
-                    if self.verbose:
-                        self.print_status(f"Poll #{poll_count}")
-                    
-                    try:
-                        # Read all data from device
-                        data = await reader.read_data()
-                        
-                        if data:
-                            # Write to Avro if configured
-                            if self.avro_file:
-                                if self.avro_wide:
-                                    # Wide format: write all values every time
-                                    self._write_avro_record(data)
-                                else:
-                                    # Narrow format: write all values (changes tracked separately)
-                                    self._write_avro_record(data)
-                            
-                            # Check for changes
-                            changes_detected = False
-                            
-                            for key, value in sorted(data.items()):
-                                if key not in self.previous_values:
-                                    # First time seeing this value
-                                    self.print_initial(key, value)
-                                    self.previous_values[key] = value
-                                    changes_detected = True
-                                elif self.previous_values[key] != value:
-                                    # Value changed
-                                    self.print_change(key, self.previous_values[key], value)
-                                    self.previous_values[key] = value
-                                    changes_detected = True
-                            
-                            if self.verbose and not changes_detected and poll_count > 1:
-                                self.print_status("No changes detected")
-                        else:
-                            if self.verbose:
-                                self.print_status("No data received", "⚠")
-                    
-                    except Exception as e:
-                        self.print_status(f"Error reading data: {e}", "✗")
-                        if self.verbose:
-                            import traceback
-                            traceback.print_exc()
-                    
-                    # Wait for next poll
-                    await asyncio.sleep(self.interval)
+                except ConnectionRecoveryError as e:
+                    # Connection needs to be restarted from scratch
+                    self.print_status(f"Connection recovery needed: {e}", "🔄")
+                    self.print_status("Restarting connection from scratch...", "🔄")
+                    # Loop will continue and reconnect
+                    continue
                 
         except KeyboardInterrupt:
             self.print_status("Monitoring stopped by user", "⏹")
@@ -400,6 +466,9 @@ Examples:
   # Record with flush after each write:
   %(prog)s --avro output.avro --flush
 
+  # Keep 10 rotated Avro files instead of default 5:
+  %(prog)s --avro output.avro --avro-history 10
+
   # Verbose mode:
   %(prog)s --verbose
         """
@@ -448,6 +517,13 @@ Examples:
         action='store_true',
         help='Flush Avro file after each write'
     )
+    parser.add_argument(
+        '--avro-history',
+        type=int,
+        default=5,
+        metavar='N',
+        help='Number of rotated Avro files to keep (default: 5)'
+    )
     
     args = parser.parse_args()
     
@@ -486,7 +562,8 @@ Examples:
         verbose=args.verbose,
         avro_file=args.avro,
         avro_wide=args.wide,
-        avro_flush=args.flush
+        avro_flush=args.flush,
+        avro_history=args.avro_history
     )
     
     await monitor.monitor()
